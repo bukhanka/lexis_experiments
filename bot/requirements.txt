@@ -1,0 +1,8 @@
+telebot
+python-dotenv
+langchain
+langchain-openai
+openai
+uuid
+langchain-google-genai
+pyyaml
