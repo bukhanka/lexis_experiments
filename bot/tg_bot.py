@@ -57,9 +57,13 @@ user_conversations: Dict[int, Dict[str, Any]] = {}
 
 class TelegramChatMemory:
     """Custom chat memory for Telegram conversations"""
-    def __init__(self, user_id):
+    def __init__(self, user_id, system_prompt=None):
         self.user_id = user_id
         self.messages = []
+        
+        # Add system message at initialization if provided
+        if system_prompt:
+            self.add_system_message(system_prompt)
     
     def add_user_message(self, message):
         self.messages.append(HumanMessage(content=message))
@@ -68,26 +72,29 @@ class TelegramChatMemory:
         self.messages.append(AIMessage(content=message))
     
     def add_system_message(self, message):
-        self.messages.append(SystemMessage(content=message))
+        # Remove any existing system messages first
+        self.messages = [msg for msg in self.messages if not isinstance(msg, SystemMessage)]
+        self.messages.insert(0, SystemMessage(content=message))
     
     def get_messages(self):
         return self.messages
 
-def create_chat_chain(system_prompt: str = DEFAULT_SYSTEM_PROMPT):
+def create_chat_chain(system_prompt: str = None):
     """Create a LangChain chat chain with configurable system prompt and robust error handling"""
+    # Use the provided system prompt, or fall back to DEFAULT_SYSTEM_PROMPT
+    prompt_to_use = system_prompt or DEFAULT_SYSTEM_PROMPT
+    
     try:
         # Initialize LLM
         if LLM_PROVIDER == "gemini":
             try:
-                # Explicitly set the API key if not already set by default credentials
                 llm = ChatGoogleGenerativeAI(
                     model="gemini-pro",
                     temperature=0.7,
-                    google_api_key=os.getenv('GOOGLE_API_KEY')  # Explicitly use environment variable
+                    google_api_key=os.getenv('GOOGLE_API_KEY')
                 )
             except Exception as gemini_error:
                 logging.warning(f"Gemini initialization failed: {gemini_error}")
-                # Fallback to OpenAI if Gemini fails
                 llm = ChatOpenAI(
                     model="gpt-4o",
                     temperature=0.7,
@@ -101,22 +108,22 @@ def create_chat_chain(system_prompt: str = DEFAULT_SYSTEM_PROMPT):
             )
         else:
             logging.error(f"Неизвестный провайдер LLM: {LLM_PROVIDER}")
-            # Fallback to OpenAI if no valid provider is specified
             llm = ChatOpenAI(
                 model="gpt-4o",
                 temperature=0.7,
                 openai_api_key=os.getenv('OPENAI_API_KEY')
             )
         
-        # Create prompt template
-        prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content=system_prompt),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}")
-        ])
+        # Create a function to generate the prompt dynamically
+        def create_prompt(system_message):
+            return ChatPromptTemplate.from_messages([
+                SystemMessage(content=system_message),
+                MessagesPlaceholder(variable_name="chat_history"),
+                ("human", "{input}")
+            ])
         
-        # Create chain
-        chain = prompt | llm
+        # Create chain with dynamic prompt generation
+        chain = create_prompt(prompt_to_use) | llm
         return chain
     
     except Exception as e:
@@ -129,13 +136,14 @@ def create_chat_chain(system_prompt: str = DEFAULT_SYSTEM_PROMPT):
                 openai_api_key=os.getenv('OPENAI_API_KEY')
             )
             
-            prompt = ChatPromptTemplate.from_messages([
-                SystemMessage(content=system_prompt),
-                MessagesPlaceholder(variable_name="chat_history"),
-                ("human", "{input}")
-            ])
+            def create_prompt(system_message):
+                return ChatPromptTemplate.from_messages([
+                    SystemMessage(content=system_message),
+                    MessagesPlaceholder(variable_name="chat_history"),
+                    ("human", "{input}")
+                ])
             
-            chain = prompt | llm
+            chain = create_prompt(prompt_to_use) | llm
             return chain
         except Exception as final_error:
             logging.critical(f"Критическая ошибка создания цепочки чата: {final_error}")
@@ -143,33 +151,26 @@ def create_chat_chain(system_prompt: str = DEFAULT_SYSTEM_PROMPT):
 
 def reset_user_conversation(user_id: int):
     """Reset user conversation state with unique user tracking"""
-    if user_id not in user_conversations:
-        user_conversations[user_id] = {
-            'user_uuid': str(uuid.uuid4()),  # Add unique user ID
-            'memory': TelegramChatMemory(user_id),
-            'chain': create_chat_chain(),
-            'active': True,
-            'rating': None,
-            'naturalness_rating': None,
-            'system_prompt': DEFAULT_SYSTEM_PROMPT # Default system prompt in Russian
-        }
-    else:
-        # Reset existing conversation while maintaining user UUID
-        user_uuid = user_conversations[user_id]['user_uuid']
-        user_conversations[user_id] = {
-            'user_uuid': user_uuid,  # Keep the same user UUID
-            'memory': TelegramChatMemory(user_id),
-            'chain': create_chat_chain(user_conversations[user_id]['system_prompt']), # Recreate chain with existing system prompt
-            'active': True,
-            'rating': None,
-            'naturalness_rating': None,
-            'system_prompt': user_conversations[user_id]['system_prompt']
-        }
+    system_prompt = DEFAULT_SYSTEM_PROMPT
+    
+    if user_id in user_conversations:
+        # If user already has a custom system prompt, use that
+        system_prompt = user_conversations[user_id].get('system_prompt', DEFAULT_SYSTEM_PROMPT)
+    
+    user_conversations[user_id] = {
+        'user_uuid': str(uuid.uuid4()),  # Add unique user ID
+        'memory': TelegramChatMemory(user_id, system_prompt),  # Pass system prompt during initialization
+        'chain': create_chat_chain(system_prompt),  # Use the system prompt
+        'active': True,
+        'rating': None,
+        'naturalness_rating': None,
+        'system_prompt': system_prompt  # Store the system prompt
+    }
 
 def create_main_keyboard():
     """Create main menu keyboard"""
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("🎯 Установить промпт", "👀 Проверить промпт")
+    markup.row("🎯 Установить промпт")
     markup.row("▶️ Начать диалог", "⏹ Завершить диалог")
     return markup
 
@@ -187,6 +188,10 @@ def create_naturalness_rating_keyboard():
     for i in range(1, 6):
         markup.add(types.InlineKeyboardButton(str(i), callback_data=f'naturalness_rating_{i}'))
     return markup
+
+def split_long_message(text, chunk_size=4000):
+    """Split a long message into chunks that fit Telegram's limits"""
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -316,11 +321,16 @@ def set_system_prompt(message):
     if user_id in user_conversations:
         current_prompt = user_conversations[user_id]['system_prompt']
     
-    # Send message with current prompt
-    bot.reply_to(
-        message, 
-        SET_PROMPT_MESSAGE.format(current_prompt=current_prompt)
-    )
+    # Split the message into chunks if needed
+    chunks = split_long_message(f"Текущий системный промпт:\n{current_prompt}\n\nХотите изменить системный промпт? Отправьте новый промпт или нажмите /cancel для отмены.")
+    
+    # Send each chunk
+    for i, chunk in enumerate(chunks):
+        if i == 0:  # First chunk
+            bot.reply_to(message, chunk)
+        else:  # Subsequent chunks
+            bot.send_message(message.chat.id, chunk)
+    
     bot.register_next_step_handler(message, save_system_prompt)
 
 def save_system_prompt(message):
@@ -331,18 +341,23 @@ def save_system_prompt(message):
     if user_id not in user_conversations:
         reset_user_conversation(user_id)
     
+    # Check if the message is a command
+    if message.text.startswith('/'):
+        bot.reply_to(message, "❌ Изменение промпта отменено.")
+        return
+    
     # Update system prompt
-    user_conversations[user_id]['system_prompt'] = message.text
+    new_system_prompt = message.text
+    user_conversations[user_id]['system_prompt'] = new_system_prompt
+    
+    # Recreate memory with new system prompt
+    user_conversations[user_id]['memory'] = TelegramChatMemory(user_id, new_system_prompt)
     
     # Recreate chain with new system prompt
-    user_conversations[user_id]['chain'] = create_chat_chain(message.text)
+    user_conversations[user_id]['chain'] = create_chat_chain(new_system_prompt)
     
-    # Reset memory and add system message
-    user_conversations[user_id]['memory'] = TelegramChatMemory(user_id)
-    user_conversations[user_id]['memory'].add_system_message(message.text)
-    
-    # Send confirmation message without including the prompt
-    bot.reply_to(message, "Системный промпт обновлен.")
+    # Send confirmation message with the new prompt
+    bot.reply_to(message, f"Системный промпт обновлен:\n{new_system_prompt}")
 
 @bot.message_handler(commands=['start_chat'])
 def start_chat(message):
@@ -464,11 +479,6 @@ def handle_start_chat_button(message):
 def handle_set_prompt_button(message):
     """Handle set prompt button press"""
     set_system_prompt(message)
-
-@bot.message_handler(func=lambda message: message.text == "👀 Проверить промпт")
-def handle_check_prompt_button(message):
-    """Handle check prompt button press"""
-    check_system_prompt(message)
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
